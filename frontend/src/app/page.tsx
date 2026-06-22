@@ -675,10 +675,9 @@ export default function Dashboard() {
                             <span className="flex items-center gap-1 text-slate-300">
                               <span className="capitalize">{strippedCat}</span>
                               {tx.category.includes("?") && (
-                                <HelpCircle 
-                                  className="w-3.5 h-3.5 text-amber-400" 
-                                  title="Categorised with Medium confidence. Click to confirm." 
-                                />
+                                <span title="Categorised with Medium confidence. Click to confirm.">
+                                  <HelpCircle className="w-3.5 h-3.5 text-amber-400" />
+                                </span>
                               )}
                             </span>
                           </td>
