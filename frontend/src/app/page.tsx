@@ -74,6 +74,7 @@ export default function Dashboard() {
       case "USD": return "$";
       case "EUR": return "€";
       case "GBP": return "£";
+      case "INR": return "₹";
       default: return code || "£";
     }
   };
@@ -798,6 +799,7 @@ export default function Dashboard() {
                   <option value="GBP">GBP (£)</option>
                   <option value="USD">USD ($)</option>
                   <option value="EUR">EUR (€)</option>
+                  <option value="INR">INR (₹)</option>
                 </select>
               </div>
 
