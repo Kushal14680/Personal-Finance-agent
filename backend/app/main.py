@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from app.config import settings
 from app.db import db
-from app.parser import parse_file_to_text
+from app.parser import parse_file_to_text, parse_tabular_file_to_raw_txs
 from app.agent import run_finance_agent
 
 # Configure logging
@@ -108,14 +108,28 @@ async def upload_statement(
     logger.info(f"Received file: {file.filename} for profile: {profile_id}")
     
     try:
-        # 1. Parse upload file content to text
-        file_bytes = await file.read()
-        raw_text = parse_file_to_text(file_bytes, file.filename)
-        
-        # 2. Get user preferences from DB
+        # 1. Get user preferences from DB first to get the currency preference
         profile = db.get_profile(profile_id)
         currency = profile.get("currency", "GBP")
         savings_goal = float(profile.get("savings_goal", 500.00))
+        
+        # 2. Read file bytes and parse
+        file_bytes = await file.read()
+        parsed_transactions = None
+        raw_text = ""
+        
+        # Try deterministic spreadsheet parsing first for CSV/Excel
+        ext = file.filename.split(".")[-1].lower()
+        if ext in ["xlsx", "xls", "csv"]:
+            try:
+                parsed_transactions = parse_tabular_file_to_raw_txs(file_bytes, file.filename, currency)
+                logger.info(f"Tabular parser successfully extracted {len(parsed_transactions)} raw transactions.")
+            except Exception as pe:
+                logger.warning(f"Tabular parser failed: {pe}. Falling back to text parsing.")
+        
+        # Fallback to raw text extraction for PDFs or if spreadsheet parsing returned nothing
+        if not parsed_transactions:
+            raw_text = parse_file_to_text(file_bytes, file.filename)
         
         # 3. Get existing transactions for recurring comparisons
         existing_txs = db.get_transactions(profile_id, limit=300)
@@ -125,7 +139,8 @@ async def upload_statement(
             raw_text=raw_text, 
             existing_txs=existing_txs,
             home_currency=currency,
-            savings_goal=savings_goal
+            savings_goal=savings_goal,
+            parsed_transactions=parsed_transactions
         )
         
         # 5. Enrich extracted transactions with profile_id and save to database

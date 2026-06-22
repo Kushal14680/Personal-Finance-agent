@@ -36,6 +36,15 @@ class ExtractedTransaction(BaseModel):
 class ExtractedTransactionList(BaseModel):
     transactions: List[ExtractedTransaction]
 
+class MerchantMapping(BaseModel):
+    description: str = Field(description="Original description or merchant keyword sent in request")
+    merchant: str = Field(description="Cleaned, recognizable merchant name")
+    category: str = Field(description="Category from taxonomy: housing, food, transport, health, entertainment, shopping, finance, income, transfer, other")
+    confidence: str = Field(description="Confidence rating: high, medium, low")
+
+class MerchantMappingList(BaseModel):
+    mappings: List[MerchantMapping]
+
 class Opportunity(BaseModel):
     action: str = Field(description="Specific actionable advice (e.g., 'Cancel your unused Netflix subscription')")
     saving: float = Field(description="Exact monthly savings amount in user's home currency")
@@ -98,7 +107,106 @@ def is_near_identical_recurring(tx1: Dict[str, Any], tx2: Dict[str, Any], allow_
 
 # 1. Parse and extract node (using LLM structured output)
 def parse_and_extract_node(state: AgentState) -> Dict[str, Any]:
-    logger.info("Starting parse_and_extract_node...")
+    # Check if tabular transactions have already been pre-parsed (via pandas)
+    if state.get("parsed_transactions"):
+        txs = state["parsed_transactions"]
+        unique_descriptions = list(set(t["description"] for t in txs if t.get("description")))
+        logger.info(f"parse_and_extract_node: Already have {len(txs)} pre-parsed transactions. Processing {len(unique_descriptions)} unique descriptions via LLM batch categoriser.")
+        
+        if not unique_descriptions:
+            return {"parsed_transactions": []}
+            
+        client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        batch_size = 30
+        mappings = {}
+        
+        for i in range(0, len(unique_descriptions), batch_size):
+            batch = unique_descriptions[i:i + batch_size]
+            prompt = f"""
+For each of the following raw bank transaction descriptions, return a cleaned merchant name, a category from the taxonomy list, and your confidence.
+
+TAXPONOMY LIST:
+  housing       [rent, mortgage, utilities, insurance]
+  food          [groceries, restaurants, cafes, delivery]
+  transport     [fuel, public_transit, ride_share, parking]
+  health        [pharmacy, gym, medical, dental]
+  entertainment [streaming, gaming, events, hobbies]
+  shopping      [clothing, electronics, household, personal]
+  finance       [bank_fees, interest, investments, tax]
+  income        [salary, freelance, refund, transfer_in]
+  transfer      [inter_account, savings_deposit]
+  other         [unclassifiable — always select this if you are not sure]
+
+CONFIDENCE RULES:
+  HIGH   -> Clear description maps to a merchant in that category.
+  MEDIUM -> Probable category but some ambiguity.
+  LOW    -> Unclassifiable (category must be set to "other").
+
+Descriptions:
+{json.dumps(batch, indent=2)}
+"""
+            try:
+                completion = client.beta.chat.completions.parse(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful merchant categorisation mapping system."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    response_format=MerchantMappingList,
+                    timeout=35.0
+                )
+                for m in completion.choices[0].message.parsed.mappings:
+                    mappings[m.description] = m.model_dump()
+            except Exception:
+                logger.exception("Error during batch merchant categorisation call")
+                for desc in batch:
+                    mappings[desc] = {
+                        "description": desc,
+                        "merchant": desc,
+                        "category": "other",
+                        "confidence": "low"
+                    }
+                    
+        # Map mappings back to all transactions
+        enriched_txs = []
+        for tx in txs:
+            desc = tx.get("description", "Unknown")
+            mapping = mappings.get(desc, {
+                "merchant": desc,
+                "category": "other",
+                "confidence": "low"
+            })
+            
+            tx_enriched = tx.copy()
+            tx_enriched["id"] = generate_tx_id(tx_enriched)
+            tx_enriched["merchant"] = mapping.get("merchant", desc)
+            
+            cat = mapping.get("category", "other")
+            conf = mapping.get("confidence", "low")
+            
+            if conf.lower() == "medium":
+                if not cat.endswith("?"):
+                    cat = f"{cat}?"
+            elif conf.lower() == "low":
+                cat = "other"
+                
+            tx_enriched["category"] = cat
+            tx_enriched["confidence"] = conf
+            tx_enriched["is_recurring"] = False
+            tx_enriched["flags"] = []
+            
+            enriched_txs.append(tx_enriched)
+            
+        return {"parsed_transactions": enriched_txs}
+
+    # PDF / Unstructured Text Workflow
+    raw_text = state.get('raw_text', '')
+    logger.info(f"Starting parse_and_extract_node... Raw text size: {len(raw_text)} characters")
+    
+    if len(raw_text) > 60000:
+        logger.warning(f"Raw text is too large ({len(raw_text)} chars). Truncating to 60000 characters to prevent API timeout.")
+        raw_text = raw_text[:60000] + "\n...[TRUNCATED FOR SIZE]..."
+        
     client = OpenAI(api_key=settings.OPENAI_API_KEY)
     
     prompt = f"""
@@ -124,7 +232,7 @@ CONFIDENCE RULES:
   LOW    -> If it is unclassifiable (must set category to "other").
 
 Raw Statement Text:
-{state['raw_text']}
+{raw_text}
 """
 
     try:
@@ -134,12 +242,12 @@ Raw Statement Text:
                 {"role": "system", "content": "You are a precise financial transaction parser."},
                 {"role": "user", "content": prompt}
             ],
-            response_format=ExtractedTransactionList
+            response_format=ExtractedTransactionList,
+            timeout=45.0
         )
         extracted = completion.choices[0].message.parsed.transactions
     except Exception as e:
-        logger.error(f"Error calling OpenAI API: {e}")
-        # Return empty transactions to prevent crash
+        logger.exception("Error calling OpenAI API during transaction extraction")
         extracted = []
 
     # Map pydantic list to standard dicts, applying IDs and default confidence overrides
@@ -565,8 +673,13 @@ def build_agent_graph():
     
     return builder.compile()
 
-# Unified executor interface
-def run_finance_agent(raw_text: str, existing_txs: List[Dict[str, Any]], home_currency: str = "GBP", savings_goal: float = 500.00) -> Dict[str, Any]:
+def run_finance_agent(
+    raw_text: str, 
+    existing_txs: List[Dict[str, Any]], 
+    home_currency: str = "GBP", 
+    savings_goal: float = 500.00,
+    parsed_transactions: List[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     graph = build_agent_graph()
     
     initial_state = {
@@ -574,7 +687,7 @@ def run_finance_agent(raw_text: str, existing_txs: List[Dict[str, Any]], home_cu
         "home_currency": home_currency,
         "savings_goal": savings_goal,
         "existing_transactions": existing_txs,
-        "parsed_transactions": [],
+        "parsed_transactions": parsed_transactions or [],
         "analysis_results": {},
         "briefing_markdown": "",
         "status": "ok",
